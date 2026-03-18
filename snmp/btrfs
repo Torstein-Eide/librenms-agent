@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+
+VERSION = 1
+
+_SIZE_UNITS = {
+    "B": 1,
+    "KiB": 1024,
+    "MiB": 1024**2,
+    "GiB": 1024**3,
+    "TiB": 1024**4,
+    "PiB": 1024**5,
+    "EiB": 1024**6,
+}
+
+
+def proc_err(argv, proc):
+    cmd = " ".join(argv) if isinstance(argv, (list, tuple)) else str(argv)
+    stderr = (proc.stderr or "").strip()
+    first = stderr.splitlines()[0] if stderr else ""
+    return f"{subprocess.CalledProcessError(proc.returncode, cmd, stderr)}{(' (' + first + ')') if first else ''}"
+
+
+def print_data(data, error, error_msg):
+    print(
+        json.dumps(
+            {
+                "data": data,
+                "error": error,
+                "errorString": error_msg,
+                "version": VERSION,
+            }
+        )
+    )
+
+
+def _default_config_path():
+    # Match the common LibreNMS agent convention: <script>.config
+    # When installed as /etc/snmp/btrfs, default config is /etc/snmp/btrfs.config
+    script = os.path.realpath(sys.argv[0])
+    return script + ".config"
+
+
+def _read_config(path):
+    # One entry per line, comments start with '#'.
+    # Supported formats:
+    #   /mountpoint
+    #   label /mountpoint
+    mounts = []
+    with open(path, "r", encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            parts = ln.split(None, 1)
+            if len(parts) == 1:
+                mounts.append({"id": parts[0], "mountpoint": parts[0]})
+            else:
+                mounts.append({"id": parts[0], "mountpoint": parts[1].strip()})
+    return mounts
+
+
+def _run(argv):
+    proc = subprocess.run(argv, capture_output=True, text=True)
+    return proc.returncode, (proc.stdout or ""), (proc.stderr or ""), proc
+
+
+def _parse_human_size_to_bytes(s):
+    # Examples: 25.44TiB, 512.00MiB, 0.00B
+    s = s.strip()
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)$", s)
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = m.group(2)
+    mul = _SIZE_UNITS.get(unit)
+    if mul is None:
+        return None
+    return int(val * mul)
+
+
+def _parse_btrfs_version(text):
+    lines = [ln.rstrip("\n") for ln in (text or "").splitlines() if ln.strip()]
+    out = {"raw": (text or "").strip()}
+    if not lines:
+        return out
+    m = re.search(r"btrfs-progs\s+v(\S+)", lines[0])
+    if m:
+        out["version"] = m.group(1)
+    # Feature flags are free-form; keep tokens.
+    if len(lines) > 1:
+        out["features"] = lines[1].split()
+    return out
+
+
+def _parse_filesystem_show(text):
+    data = {"devices": []}
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        m = re.search(r"Label:\s+'([^']*)'\s+uuid:\s+([0-9a-fA-F-]+)", ln)
+        if m:
+            data["label"] = m.group(1)
+            data["uuid"] = m.group(2)
+            continue
+        m = re.search(r"Total devices\s+(\d+)\s+FS bytes used\s+(\S+)", ln)
+        if m:
+            data["total_devices"] = int(m.group(1))
+            raw = m.group(2)
+            data["fs_bytes_used"] = {"raw": raw, "bytes": _parse_human_size_to_bytes(raw)}
+            continue
+        m = re.match(r"^devid\s+(\d+)\s+size\s+(\S+)\s+used\s+(\S+)\s+path\s+(\S+)", ln)
+        if m:
+            devid = int(m.group(1))
+            size_raw = m.group(2)
+            used_raw = m.group(3)
+            path = m.group(4)
+            data["devices"].append(
+                {
+                    "devid": devid,
+                    "path": path,
+                    "size": {"raw": size_raw, "bytes": _parse_human_size_to_bytes(size_raw)},
+                    "used": {"raw": used_raw, "bytes": _parse_human_size_to_bytes(used_raw)},
+                }
+            )
+    return data
+
+
+def _parse_filesystem_df(text):
+    # Example line: Data, RAID6: total=25.90TiB, used=25.41TiB
+    out = {"classes": []}
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        m = re.match(r"^([^,]+),\s*([^:]+):\s*(.*)$", ln)
+        if not m:
+            continue
+        clazz = m.group(1).strip()
+        profile = m.group(2).strip()
+        rest = m.group(3).strip()
+        values = {}
+        for item in rest.split(","):
+            if "=" not in item:
+                continue
+            k, v = item.strip().split("=", 1)
+            v = v.strip()
+            values[k] = {"raw": v, "bytes": _parse_human_size_to_bytes(v)}
+        out["classes"].append({"class": clazz, "profile": profile, **values})
+    return out
+
+
+def _parse_device_stats(text):
+    # Format (common): [/dev/sdc].write_io_errs    0
+    out = {}
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        m = re.match(r"^\[([^\]]+)\]\.([A-Za-z0-9_]+)\s+(\d+)\s*$", ln)
+        if not m:
+            continue
+        dev = m.group(1)
+        key = m.group(2)
+        val = int(m.group(3))
+        out.setdefault(dev, {})[key] = val
+    return {"devices": out}
+
+
+def _parse_filesystem_usage_bytes(text):
+    lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
+
+    overall = {}
+    profiles = []
+    unallocated = {"devices": {}}
+
+    i = 0
+    # Overall
+    while i < len(lines):
+        if lines[i].strip().startswith("Overall:"):
+            i += 1
+            break
+        i += 1
+
+    while i < len(lines):
+        ln = lines[i]
+        if not ln.strip():
+            i += 1
+            break
+        m = re.match(r"^\s*([^:]+):\s*(.*)$", ln)
+        if m:
+            key = m.group(1).strip().lower()
+            val = m.group(2).strip()
+            if key.startswith("free (estimated)"):
+                # "<bytes>\t(min: <bytes>)"
+                compact = re.sub(r"\s+", " ", val.replace("\t", " ")).strip()
+                m2 = re.match(r"^(\d+)\s*\(min:\s*(\d+)\)\s*$", compact)
+                if m2:
+                    overall["free_estimated_bytes"] = int(m2.group(1))
+                    overall["free_estimated_min_bytes"] = int(m2.group(2))
+                else:
+                    overall["free_estimated_raw"] = val
+            elif key.startswith("global reserve"):
+                compact = re.sub(r"\s+", " ", val.replace("\t", " ")).strip()
+                m2 = re.match(r"^(\d+)\s*\(used:\s*(\d+)\)\s*$", compact)
+                if m2:
+                    overall["global_reserve_bytes"] = int(m2.group(1))
+                    overall["global_reserve_used_bytes"] = int(m2.group(2))
+                else:
+                    overall["global_reserve_raw"] = val
+            elif key in {
+                "device size",
+                "device allocated",
+                "device unallocated",
+                "device missing",
+                "device slack",
+                "used",
+                "free (statfs, df)",
+            }:
+                m2 = re.match(r"^(\d+)$", val)
+                if key == "free (statfs, df)":
+                    overall["free_statfs_df_bytes"] = int(m2.group(1)) if m2 else val
+                else:
+                    overall[key.replace(" ", "_") + "_bytes"] = int(m2.group(1)) if m2 else val
+            elif key in {"data ratio", "metadata ratio"}:
+                try:
+                    overall[key.replace(" ", "_")] = float(val)
+                except ValueError:
+                    overall[key.replace(" ", "_")] = val
+            elif key.startswith("multiple profiles"):
+                overall["multiple_profiles"] = (val.lower() == "yes")
+            else:
+                overall[key.replace(" ", "_")] = val
+        i += 1
+
+    # Profiles + unallocated
+    profile_re = re.compile(
+        r"^([A-Za-z]+),([^:]+):\s+Size:(\d+),\s+Used:(\d+)(?:\s+\(([0-9.]+)%\))?\s*$"
+    )
+    while i < len(lines):
+        ln = lines[i].strip()
+        if not ln:
+            i += 1
+            continue
+        if ln.startswith("Unallocated:"):
+            i += 1
+            while i < len(lines) and lines[i].strip() and not lines[i].lstrip().startswith("#"):
+                m = re.match(r"^\s*(\S+)\s+(\d+)\s*$", lines[i])
+                if m:
+                    unallocated["devices"][m.group(1)] = int(m.group(2))
+                i += 1
+            continue
+
+        m = profile_re.match(ln)
+        if m:
+            clazz = m.group(1)
+            profile = m.group(2)
+            size_b = int(m.group(3))
+            used_b = int(m.group(4))
+            used_pct = float(m.group(5)) if m.group(5) is not None else None
+            p = {
+                "class": clazz,
+                "profile": profile,
+                "size_bytes": size_b,
+                "used_bytes": used_b,
+                "used_pct": used_pct,
+                "devices": {},
+            }
+            i += 1
+            while i < len(lines) and lines[i].strip() and not lines[i].lstrip().startswith("#"):
+                m2 = re.match(r"^\s*(\S+)\s+(\d+)\s*$", lines[i])
+                if m2:
+                    p["devices"][m2.group(1)] = int(m2.group(2))
+                    i += 1
+                    continue
+                break
+            profiles.append(p)
+            continue
+        i += 1
+
+    return {"overall": overall, "profiles": profiles, "unallocated": unallocated}
+
+
+def _parse_filesystem_usage_T(text):
+    lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
+    overall = {}
+    devices = []
+    totals = None
+    used = None
+
+    i = 0
+    # Overall
+    while i < len(lines):
+        if lines[i].strip().startswith("Overall:"):
+            i += 1
+            break
+        i += 1
+
+    while i < len(lines):
+        ln = lines[i]
+        if not ln.strip():
+            i += 1
+            break
+        m = re.match(r"^\s*([^:]+):\s*(.*)$", ln)
+        if m:
+            key = m.group(1).strip().lower().replace(" ", "_")
+            val = m.group(2).strip()
+            if key.startswith("free_(estimated)"):
+                compact = re.sub(r"\s+", " ", val.replace("\t", " ")).strip()
+                m2 = re.match(r"^(\S+)\s*\(min:\s*(\S+)\)\s*$", compact)
+                if m2:
+                    v = m2.group(1)
+                    vmin = m2.group(2)
+                    overall["free_estimated"] = {"raw": v, "bytes": _parse_human_size_to_bytes(v)}
+                    overall["free_estimated_min"] = {
+                        "raw": vmin,
+                        "bytes": _parse_human_size_to_bytes(vmin),
+                    }
+                else:
+                    overall["free_estimated_raw"] = val
+            elif key.startswith("global_reserve"):
+                compact = re.sub(r"\s+", " ", val.replace("\t", " ")).strip()
+                m2 = re.match(r"^(\S+)\s*\(used:\s*(\S+)\)\s*$", compact)
+                if m2:
+                    v = m2.group(1)
+                    vused = m2.group(2)
+                    overall["global_reserve"] = {"raw": v, "bytes": _parse_human_size_to_bytes(v)}
+                    overall["global_reserve_used"] = {
+                        "raw": vused,
+                        "bytes": _parse_human_size_to_bytes(vused),
+                    }
+                else:
+                    overall["global_reserve_raw"] = val
+            elif key in {
+                "device_size",
+                "device_allocated",
+                "device_unallocated",
+                "device_missing",
+                "device_slack",
+                "used",
+                "free_(statfs,_df)",
+            }:
+                overall[key.replace("(statfs,_df)", "statfs_df")] = {
+                    "raw": val,
+                    "bytes": _parse_human_size_to_bytes(val),
+                }
+            elif key in {"data_ratio", "metadata_ratio"}:
+                try:
+                    overall[key] = float(val)
+                except ValueError:
+                    overall[key] = val
+            elif key == "multiple_profiles":
+                overall[key] = (val.lower() == "yes")
+            else:
+                overall[key] = val
+        i += 1
+
+    # Device table
+    header1 = None
+    header2 = None
+    while i < len(lines):
+        if re.match(r"^\s*Id\s+Path\s+", lines[i]):
+            header2 = re.split(r"\s+", lines[i].strip())
+            if i > 0:
+                header1 = re.split(r"\s+", lines[i - 1].strip())
+            i += 1
+            break
+        i += 1
+
+    if header2 and "Unallocated" in header2:
+        idx_unalloc = header2.index("Unallocated")
+        type_profiles = header2[2:idx_unalloc]
+        types = header1 if header1 else [f"col{i}" for i in range(len(type_profiles))]
+        if len(types) != len(type_profiles):
+            types = types[: len(type_profiles)]
+            while len(types) < len(type_profiles):
+                types.append(f"col{len(types)}")
+
+        while i < len(lines):
+            ln = lines[i].strip()
+            if not ln or ln.startswith("#"):
+                i += 1
+                continue
+            if ln.startswith("--"):
+                i += 1
+                continue
+            parts = re.split(r"\s+", ln)
+            if len(parts) < 2:
+                i += 1
+                continue
+
+            if parts[0].isdigit():
+                row = {"id": int(parts[0]), "path": parts[1], "usage": {}}
+                pos = 2
+                for t, prof in zip(types, type_profiles):
+                    raw = parts[pos] if pos < len(parts) else "-"
+                    row["usage"][t] = {"profile": prof, "raw": raw, "bytes": _parse_human_size_to_bytes(raw) if raw != "-" else None}
+                    pos += 1
+                for k in ("Unallocated", "Total", "Slack"):
+                    raw = parts[pos] if pos < len(parts) else "-"
+                    row[k.lower()] = {"raw": raw, "bytes": _parse_human_size_to_bytes(raw) if raw != "-" else None}
+                    pos += 1
+                devices.append(row)
+            elif parts[0] == "Total":
+                totals = {"raw": ln}
+            elif parts[0] == "Used":
+                used = {"raw": ln}
+            i += 1
+
+    out = {"overall": overall, "devices": devices}
+    if totals is not None:
+        out["total_row"] = totals
+    if used is not None:
+        out["used_row"] = used
+    return out
+
+
+def main(args):
+    if shutil.which("btrfs") is None:
+        print_data({}, 127, "btrfs command not found in PATH")
+        return 127
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "-c",
+        "--config",
+        default=_default_config_path(),
+        help="Config file (default: <script>.config)",
+    )
+    parser.add_argument("-h", "--help", action="store_true", help="Show help")
+    ns, extra = parser.parse_known_args(args)
+    if extra:
+        print_data({}, 1, f"Unknown arguments: {' '.join(extra)}")
+        return 1
+    if ns.help:
+        print(
+            "Usage: btrfs [-c <config>]\n"
+            "\n"
+            "Mountpoints are read from <script>.config (or -c).\n"
+            "Config format: one mountpoint per line, or 'label <mountpoint>'.\n"
+        )
+        return 0
+
+    targets = []
+    try:
+        targets = _read_config(ns.config)
+    except FileNotFoundError:
+        print_data({}, 1, f"Config not found: {ns.config}")
+        return 1
+    except OSError as e:
+        print_data({}, 1, f"Failed to read config {ns.config}: {e}")
+        return 1
+
+    if not targets:
+        print_data({}, 1, "No mountpoints configured")
+        return 1
+
+    # Always collect version once.
+    v_rc, v_out, v_err, v_proc = _run(["btrfs", "--version"])
+    if v_rc != 0:
+        print_data({}, v_rc, proc_err(["btrfs", "--version"], v_proc))
+        return v_rc
+    btrfs_version = _parse_btrfs_version((v_out or v_err).strip())
+
+    def collect_for_mount(mp):
+        mp = mp.rstrip("/") or "/"
+        fs = {"mountpoint": mp, "warnings": {}, "errors": {}}
+        commands = [
+            ("filesystem_show", ["btrfs", "filesystem", "show", mp], _parse_filesystem_show),
+            ("filesystem_usage_T", ["btrfs", "filesystem", "usage", "-T", mp], _parse_filesystem_usage_T),
+            ("filesystem_usage_bytes", ["btrfs", "filesystem", "usage", "-b", mp], _parse_filesystem_usage_bytes),
+            ("filesystem_df", ["btrfs", "filesystem", "df", mp], _parse_filesystem_df),
+            ("device_stats", ["btrfs", "device", "stats", mp], _parse_device_stats),
+        ]
+        ok = 0
+        first_err = None
+        for key, argv, parse_fn in commands:
+            rc, out, err, proc = _run(argv)
+            if rc != 0:
+                msg = proc_err(argv, proc)
+                fs["errors"][key] = {"rc": rc, "message": msg, "stderr": (err or "").strip()}
+                if first_err is None:
+                    first_err = msg
+                continue
+            ok += 1
+            if (err or "").strip():
+                fs["warnings"][key] = err.strip()
+            text = out.strip() if out.strip() else err.strip()
+            fs[key] = parse_fn(text)
+        return fs, ok, first_err
+
+    # Backward compatible single-mount output.
+    if len(targets) == 1:
+        fs, ok, first_err = collect_for_mount(targets[0]["mountpoint"])
+        data = {"btrfs_version": btrfs_version, **fs}
+        if ok == 0:
+            print_data(data, 1, first_err or "all btrfs commands failed")
+            return 1
+        print_data(data, 0, "")
+        return 0
+
+    # Multi-mount output.
+    out = {
+        "btrfs_version": btrfs_version,
+        "filesystems": {},
+    }
+    total_ok = 0
+    first_err = None
+    for t in targets:
+        fs, ok, ferr = collect_for_mount(t["mountpoint"])
+        out["filesystems"][t["id"]] = fs
+        total_ok += ok
+        if first_err is None and ferr:
+            first_err = ferr
+
+    if total_ok == 0:
+        print_data(out, 1, first_err or "all btrfs commands failed")
+        return 1
+
+    print_data(out, 0, "")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
