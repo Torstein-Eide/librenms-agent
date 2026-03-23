@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 import argparse
+import base64
+import gzip
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 VERSION = 1
@@ -29,23 +32,54 @@ def proc_err(argv, proc):
 
 
 def print_data(data, error, error_msg):
-    print(
-        json.dumps(
-            {
-                "data": data,
-                "error": error,
-                "errorString": error_msg,
-                "version": VERSION,
-            }
-        )
+    return json.dumps(
+        {
+            "data": data,
+            "error": error,
+            "errorString": error_msg,
+            "version": VERSION,
+        }
     )
 
 
+def _gzip_base64(text):
+    raw = text.encode("utf-8")
+    return base64.b64encode(gzip.compress(raw)).decode("ascii")
+
+
+def emit_data(data, error, error_msg, output_path=None, compress=False):
+    payload = print_data(data, error, error_msg)
+    if compress:
+        payload = _gzip_base64(payload)
+    if not output_path or output_path == "-":
+        print(payload)
+        return True
+
+    out_dir = os.path.dirname(output_path)
+    temp_path = None
+    try:
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix=".btrfs.", dir=(out_dir or None))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.write("\n")
+        os.replace(temp_path, output_path)
+        return True
+    except OSError as e:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        print(print_data({}, 1, f"Failed to write output {output_path}: {e}"))
+        return False
+
+
 def _default_config_path():
-    # Match the common LibreNMS agent convention: <script>.config
-    # When installed as /etc/snmp/btrfs, default config is /etc/snmp/btrfs.config
+    # Use the documented extension layout.
     script = os.path.realpath(sys.argv[0])
-    return script + ".config"
+    return f"/etc/snmp/extension/{os.path.basename(script)}.conf"
 
 
 def _read_config(path):
@@ -53,18 +87,83 @@ def _read_config(path):
     # Supported formats:
     #   /mountpoint
     #   label /mountpoint
+    #   compress true|false
     mounts = []
+    compress = True
     with open(path, "r", encoding="utf-8") as f:
         for ln in f:
             ln = ln.strip()
             if not ln or ln.startswith("#"):
+                continue
+            m = re.match(r"^(compress|gzip)\s+(\S+)\s*$", ln, re.IGNORECASE)
+            if m:
+                val = m.group(2).strip().lower()
+                if val in {"1", "true", "yes", "on"}:
+                    compress = True
+                elif val in {"0", "false", "no", "off"}:
+                    compress = False
                 continue
             parts = ln.split(None, 1)
             if len(parts) == 1:
                 mounts.append({"id": parts[0], "mountpoint": parts[0]})
             else:
                 mounts.append({"id": parts[0], "mountpoint": parts[1].strip()})
+    return {"mounts": mounts, "compress": compress}
+
+
+def _unescape_fstab_field(field):
+    def repl(m):
+        return chr(int(m.group(1), 8))
+
+    return re.sub(r"\\([0-7]{3})", repl, field)
+
+
+def _read_btrfs_mounts_from_fstab(path="/etc/fstab"):
+    mounts = []
+    seen = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            if "#" in ln:
+                ln = ln.split("#", 1)[0].rstrip()
+            if not ln:
+                continue
+            parts = ln.split()
+            if len(parts) < 3:
+                continue
+            fs_vfstype = parts[2].strip().lower()
+            if fs_vfstype != "btrfs":
+                continue
+            mountpoint = _unescape_fstab_field(parts[1].strip())
+            if mountpoint and mountpoint not in seen:
+                seen.add(mountpoint)
+                mounts.append(mountpoint)
     return mounts
+
+
+def _write_autogen_config(config_path, mountpoints):
+    out_dir = os.path.dirname(config_path)
+    temp_path = None
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".btrfs.config.", dir=(out_dir or None))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("# Auto-generated from /etc/fstab (btrfs entries)\n")
+            f.write("compress true\n")
+            for mp in mountpoints:
+                f.write(mp)
+                f.write("\n")
+        os.replace(temp_path, config_path)
+    except OSError:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        raise
 
 
 def _run(argv):
@@ -73,8 +172,10 @@ def _run(argv):
 
 
 def _parse_human_size_to_bytes(s):
-    # Examples: 25.44TiB, 512.00MiB, 0.00B
+    # Examples: 25.44TiB, 512.00MiB, 0.00B, 123456
     s = s.strip()
+    if re.match(r"^[0-9]+$", s):
+        return int(s)
     m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)$", s)
     if not m:
         return None
@@ -422,49 +523,108 @@ def _parse_filesystem_usage_T(text):
 
 
 def main(args):
-    if shutil.which("btrfs") is None:
-        print_data({}, 127, "btrfs command not found in PATH")
-        return 127
-
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         "-c",
         "--config",
         default=_default_config_path(),
-        help="Config file (default: <script>.config)",
+        help="Config file (default: /etc/snmp/extension/<name>.conf)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="/run/snmp/extension/btrfs",
+        help="Write JSON output to file (default: /run/snmp/extension/btrfs, use '-' for stdout)",
+    )
+    parser.add_argument(
+        "--fstab",
+        default="/etc/fstab",
+        help="fstab path used for auto-generated config (default: /etc/fstab)",
+    )
+    parser.add_argument(
+        "-z",
+        "--gzip-base64",
+        dest="gzip_base64",
+        action="store_true",
+        default=None,
+        help="Write output as gzip+base64 (default from config; defaults to enabled)",
     )
     parser.add_argument("-h", "--help", action="store_true", help="Show help")
     ns, extra = parser.parse_known_args(args)
     if extra:
-        print_data({}, 1, f"Unknown arguments: {' '.join(extra)}")
+        emit_data({}, 1, f"Unknown arguments: {' '.join(extra)}", ns.output, True)
         return 1
     if ns.help:
         print(
-            "Usage: btrfs [-c <config>]\n"
+            "Usage: btrfs [-c <config>] [-o <output>]\n"
             "\n"
-            "Mountpoints are read from <script>.config (or -c).\n"
+            "Mountpoints are read from /etc/snmp/extension/btrfs.conf (or -c).\n"
             "Config format: one mountpoint per line, or 'label <mountpoint>'.\n"
+            "Config option: 'compress true|false' (default: true).\n"
+            "If config is missing/empty, it is auto-generated from btrfs lines in /etc/fstab.\n"
+            "Default output is /run/snmp/extension/btrfs (use -o - for stdout).\n"
         )
         return 0
 
+    if shutil.which("btrfs") is None:
+        emit_data({}, 127, "btrfs command not found in PATH", ns.output, True)
+        return 127
+
     targets = []
+    compress = True
     try:
-        targets = _read_config(ns.config)
+        cfg = _read_config(ns.config)
+        targets = cfg["mounts"]
+        compress = cfg["compress"]
     except FileNotFoundError:
-        print_data({}, 1, f"Config not found: {ns.config}")
-        return 1
+        try:
+            auto_mounts = _read_btrfs_mounts_from_fstab(ns.fstab)
+        except OSError as e:
+            emit_data({}, 1, f"Config not found: {ns.config}; failed reading {ns.fstab}: {e}", ns.output, True)
+            return 1
+        if not auto_mounts:
+            emit_data({}, 1, f"Config not found: {ns.config}; no btrfs mountpoints in {ns.fstab}", ns.output, True)
+            return 1
+        try:
+            _write_autogen_config(ns.config, auto_mounts)
+            cfg = _read_config(ns.config)
+            targets = cfg["mounts"]
+            compress = cfg["compress"]
+        except OSError as e:
+            emit_data({}, 1, f"Config not found: {ns.config}; failed auto-generating config: {e}", ns.output, True)
+            return 1
     except OSError as e:
-        print_data({}, 1, f"Failed to read config {ns.config}: {e}")
+        emit_data({}, 1, f"Failed to read config {ns.config}: {e}", ns.output, True)
         return 1
 
+    if ns.gzip_base64 is True:
+        compress = True
+
     if not targets:
-        print_data({}, 1, "No mountpoints configured")
-        return 1
+        try:
+            auto_mounts = _read_btrfs_mounts_from_fstab(ns.fstab)
+        except OSError as e:
+            emit_data({}, 1, f"No mountpoints configured; failed reading {ns.fstab}: {e}", ns.output, compress)
+            return 1
+        if not auto_mounts:
+            emit_data({}, 1, f"No mountpoints configured and no btrfs mountpoints in {ns.fstab}", ns.output, compress)
+            return 1
+        try:
+            _write_autogen_config(ns.config, auto_mounts)
+            cfg = _read_config(ns.config)
+            targets = cfg["mounts"]
+            compress = True if ns.gzip_base64 is True else cfg["compress"]
+        except OSError as e:
+            emit_data({}, 1, f"Failed auto-generating config {ns.config}: {e}", ns.output, compress)
+            return 1
+        if not targets:
+            emit_data({}, 1, "No mountpoints configured", ns.output, compress)
+            return 1
 
     # Always collect version once.
     v_rc, v_out, v_err, v_proc = _run(["btrfs", "--version"])
     if v_rc != 0:
-        print_data({}, v_rc, proc_err(["btrfs", "--version"], v_proc))
+        emit_data({}, v_rc, proc_err(["btrfs", "--version"], v_proc), ns.output, compress)
         return v_rc
     btrfs_version = _parse_btrfs_version((v_out or v_err).strip())
 
@@ -472,10 +632,10 @@ def main(args):
         mp = mp.rstrip("/") or "/"
         fs = {"mountpoint": mp, "warnings": {}, "errors": {}}
         commands = [
-            ("filesystem_show", ["btrfs", "filesystem", "show", mp], _parse_filesystem_show),
-            ("filesystem_usage_T", ["btrfs", "filesystem", "usage", "-T", mp], _parse_filesystem_usage_T),
+            ("filesystem_show", ["btrfs", "filesystem", "show", "--raw", mp], _parse_filesystem_show),
+            ("filesystem_usage_T", ["btrfs", "filesystem", "usage", "-b", "-T", mp], _parse_filesystem_usage_T),
             ("filesystem_usage_bytes", ["btrfs", "filesystem", "usage", "-b", mp], _parse_filesystem_usage_bytes),
-            ("filesystem_df", ["btrfs", "filesystem", "df", mp], _parse_filesystem_df),
+            ("filesystem_df", ["btrfs", "filesystem", "df", "-b", mp], _parse_filesystem_df),
             ("device_stats", ["btrfs", "device", "stats", mp], _parse_device_stats),
         ]
         ok = 0
@@ -500,9 +660,11 @@ def main(args):
         fs, ok, first_err = collect_for_mount(targets[0]["mountpoint"])
         data = {"btrfs_version": btrfs_version, **fs}
         if ok == 0:
-            print_data(data, 1, first_err or "all btrfs commands failed")
+            if not emit_data(data, 1, first_err or "all btrfs commands failed", ns.output, compress):
+                return 1
             return 1
-        print_data(data, 0, "")
+        if not emit_data(data, 0, "", ns.output, compress):
+            return 1
         return 0
 
     # Multi-mount output.
@@ -520,10 +682,12 @@ def main(args):
             first_err = ferr
 
     if total_ok == 0:
-        print_data(out, 1, first_err or "all btrfs commands failed")
+        if not emit_data(out, 1, first_err or "all btrfs commands failed", ns.output, compress):
+            return 1
         return 1
 
-    print_data(out, 0, "")
+    if not emit_data(out, 0, "", ns.output, compress):
+        return 1
     return 0
 
 
